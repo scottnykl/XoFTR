@@ -1,0 +1,18 @@
+# Camera calibration for XoFTR scene generation.
+# Provide intrinsics (fx, fy, cx, cy) and distortion coefficients for each sensor.
+# Distortion follows OpenCV convention: [k1, k2, p1, p2, k3, ...] (up to 8 coeffs).
+# Set dist to all zeros if images are already undistorted.
+
+visible:
+  fx: 2948.12
+  fy: 2940.02
+  cx: 1929.92
+  cy: 1072.14
+  dist: [0.271, -0.932, -0.00238, -0.00225, 0.891]
+
+thermal:
+  fx: 768.62
+  fy: 766.14
+  cx: 316.95
+  cy: 248.34
+  dist: [-0.343, -0.0215, 0.000615, -0.00097, 0.365]

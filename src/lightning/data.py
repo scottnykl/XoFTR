@@ -123,7 +123,7 @@ class MultiSceneDataModule(pl.LightningDataModule):
             self.world_size = dist.get_world_size()
             self.rank = dist.get_rank()
             logger.info(f"[rank:{self.rank}] world_size: {self.world_size}")
-        except AssertionError as ae:
+        except (AssertionError, RuntimeError) as ae:
             self.world_size = 1
             self.rank = 0
             logger.warning(str(ae) + " (set wolrd_size=1 and rank=0)")
@@ -338,8 +338,11 @@ class MultiSceneDataModule(pl.LightningDataModule):
 
     def test_dataloader(self, *args, **kwargs):
         logger.info(f'[rank:{self.rank}/{self.world_size}]: Test Sampler and DataLoader re-init.')
-        sampler = DistributedSampler(self.test_dataset, shuffle=False)
-        return DataLoader(self.test_dataset, sampler=sampler, **self.test_loader_params)
+        if self.world_size > 1:
+            sampler = DistributedSampler(self.test_dataset, shuffle=False)
+            return DataLoader(self.test_dataset, sampler=sampler, **self.test_loader_params)
+        params = {k: v for k, v in self.test_loader_params.items() if k != 'shuffle'}
+        return DataLoader(self.test_dataset, shuffle=False, **params)
 
 
 def _build_dataset(dataset: Dataset, *args, **kwargs):
