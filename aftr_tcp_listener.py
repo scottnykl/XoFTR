@@ -27,6 +27,9 @@ from typing import Optional, Callable, List, Tuple
 import argparse
 import signal
 import sys
+import logging
+
+log = logging.getLogger("aftr_tcp")
 
 
 # ---------------------------------------------------------------------------
@@ -328,27 +331,35 @@ class AftrTcpListener:
     async def run_sink(self, host: str = "127.0.0.1", port: int = 12676,
                        subscribe_idx: int = -1):
         """Connect to an AftrBurner ImGui_Stream_Source and receive live images."""
-        print(f"Connecting to AftrBurner Source at {host}:{port}...")
+        print(f"Connecting to AftrBurner Source at {host}:{port}...", flush=True)
         reader, writer = await asyncio.open_connection(host, port)
-        print(f"Connected. Sending subscription...")
+        print(f"Connected to {host}:{port}.", flush=True)
 
         # Send NetMsg_Subscribe_to_Stream_Source (payload: int32 idx)
         w = NetMsgWriter()
         w.write_int32(subscribe_idx)
-        writer.write(build_netmsg("NetMsg_Subscribe_to_Stream_Source", w.to_bytes()))
+        sub_bytes = build_netmsg("NetMsg_Subscribe_to_Stream_Source", w.to_bytes())
+        writer.write(sub_bytes)
         await writer.drain()
+        log.debug("Sent Subscribe (%d bytes): %s", len(sub_bytes), sub_bytes.hex())
+        print(f"Sent subscription (idx={subscribe_idx}).", flush=True)
 
         # Send NetMsg_SessionStreamMode_to_LiveStream (empty payload)
-        writer.write(build_netmsg("NetMsg_SessionStreamMode_to_LiveStream"))
+        live_bytes = build_netmsg("NetMsg_SessionStreamMode_to_LiveStream")
+        writer.write(live_bytes)
         await writer.drain()
-        print("Subscribed to live stream. Waiting for data...")
+        log.debug("Sent LiveStream (%d bytes): %s", len(live_bytes), live_bytes.hex())
+        print("Sent live stream request. Waiting for data...", flush=True)
 
         try:
             while True:
                 msg_id, payload = await read_one_netmsg(reader)
+                log.debug("Recv msg_id=0x%08X len=%d", msg_id, len(payload))
                 self._dispatch(msg_id, payload)
-        except (asyncio.IncompleteReadError, ConnectionError):
-            print("Connection to source closed.")
+        except asyncio.CancelledError:
+            print("Sink task cancelled.", flush=True)
+        except (asyncio.IncompleteReadError, ConnectionError) as e:
+            print(f"Connection to source closed: {e}", flush=True)
         finally:
             writer.close()
 
@@ -364,7 +375,7 @@ def _make_image_handler(show: bool):
         nonlocal cv2_window
         print(f"  Image: {img.width}x{img.height} {img.comp_layout.name} "
               f"frame={img.frame_idx} ts={img.timestamp_utc} "
-              f"pixels={img.pixels.shape} dtype={img.pixels.dtype}")
+              f"pixels={img.pixels.shape} dtype={img.pixels.dtype}", flush=True)
 
         if not show:
             return
@@ -392,7 +403,7 @@ def _make_image_handler(show: bool):
 
 def _default_raw_handler(msg_id: int, payload: bytes):
     name = MSG_NAME.get(msg_id, f"Unknown(0x{msg_id:08X})")
-    print(f"  NetMsg: {name} (id={msg_id}) payload={len(payload)} bytes")
+    print(f"  NetMsg: {name} (id={msg_id}) payload={len(payload)} bytes", flush=True)
 
     if msg_id == MSG_ID.get("NetMsgSendString"):
         print(f"    String: '{parse_send_string(payload)}'")
@@ -416,22 +427,65 @@ def main():
                         help="Subscription index for sink mode (default: -1)")
     parser.add_argument("--show", action="store_true",
                         help="Display received images in an OpenCV window")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable debug logging (hex dumps, per-message logs)")
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.WARNING,
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+    )
 
     listener = AftrTcpListener()
     listener.on_image(_make_image_handler(args.show))
     listener.on_raw_message(_default_raw_handler)
 
+    _run_async(listener, args)
+
+
+def _run_async(listener, args):
+    """Run the asyncio event loop with proper Ctrl+C handling on Windows."""
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    if args.mode == "server":
+        main_coro = listener.run_server(args.host, args.port)
+    else:
+        main_coro = listener.run_sink(args.host, args.port, args.subscribe_idx)
+
+    main_task = loop.create_task(main_coro)
+
+    # On Windows, asyncio doesn't wake up to handle KeyboardInterrupt while
+    # blocked on I/O. This periodic no-op task forces the loop to wake up
+    # so Ctrl+C is noticed.
+    async def _keepalive():
+        while True:
+            await asyncio.sleep(0.2)
+
+    keepalive_task = loop.create_task(_keepalive())
+
+    def _shutdown(signum=None, frame=None):
+        print("\nCtrl+C received, shutting down...", flush=True)
+        main_task.cancel()
+        keepalive_task.cancel()
+
+    signal.signal(signal.SIGINT, _shutdown)
+
     try:
-        if args.mode == "server":
-            asyncio.run(listener.run_server(args.host, args.port))
-        else:
-            asyncio.run(listener.run_sink(args.host, args.port, args.subscribe_idx))
-    except KeyboardInterrupt:
-        print("\nShutting down.")
+        loop.run_until_complete(main_task)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        keepalive_task.cancel()
+        try:
+            loop.run_until_complete(keepalive_task)
+        except asyncio.CancelledError:
+            pass
+        loop.close()
+        print("Done.", flush=True)
 
 
 if __name__ == "__main__":
