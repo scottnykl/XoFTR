@@ -1,0 +1,438 @@
+"""AftrBurner TCP Listener — receives NetMsg messages from an AftrBurner engine.
+
+Can operate in two modes:
+
+  SERVER mode (default): Python listens on a port. The AftrBurner engine
+  connects to Python via NetMessengerClient. Use this when the engine is
+  configured to send data to Python's IP:PORT.
+
+    python aftr_tcp_listener.py --mode server --port 12690
+
+  SINK mode: Python connects to an AftrBurner ImGui_Stream_Source, subscribes,
+  and receives a live stream of images. Use this to tap into an existing
+  Source that is already running.
+
+    python aftr_tcp_listener.py --mode sink --host 127.0.0.1 --port 12676
+
+Received images are stored as numpy arrays and can be accessed via callbacks.
+Run standalone to see incoming messages printed to the console.
+"""
+
+import asyncio
+import struct
+import numpy as np
+from enum import IntEnum
+from dataclasses import dataclass, field
+from typing import Optional, Callable, List, Tuple
+import argparse
+import signal
+import sys
+
+
+# ---------------------------------------------------------------------------
+# AftrBurner NetMsg wire protocol constants
+# ---------------------------------------------------------------------------
+
+HEADER_SIZE = 8  # 4 bytes msg_id + 4 bytes payload_length, both big-endian
+HEADER_STRUCT = struct.Struct(">II")  # two big-endian uint32
+
+
+def fnv1a_32(name: str) -> int:
+    """Compute FNV-1a 32-bit hash of a class name string, matching AftrBurner's implementation."""
+    h = 2166136261  # FNV offset basis
+    for c in name.encode("ascii"):
+        h ^= c
+        h = (h * 16777619) & 0xFFFFFFFFFFFFFFFF  # 64-bit intermediate
+    return h & 0xFFFFFFFF
+
+
+# Pre-compute message IDs for known NetMsg types
+MSG_ID = {
+    "NetMsgGeneric": 1,
+    "NetMsgSend_GCam_Image": fnv1a_32("NetMsgSend_GCam_Image"),
+    "TypeA_NetMsgSend_GCam_Image": fnv1a_32("TypeA_NetMsgSend_GCam_Image"),
+    "NetMsg_Subscribe_to_Stream_Source": fnv1a_32("NetMsg_Subscribe_to_Stream_Source"),
+    "NetMsg_SessionStreamMode_to_LiveStream": fnv1a_32("NetMsg_SessionStreamMode_to_LiveStream"),
+    "NetMsg_SessionStreamMode_to_UponRequest": fnv1a_32("NetMsg_SessionStreamMode_to_UponRequest"),
+    "NetMsg_Request_Next_SensorDatum": fnv1a_32("NetMsg_Request_Next_SensorDatum"),
+    "NetMsgSendString": fnv1a_32("NetMsgSendString"),
+    "NetMsgSendDCM3x3": fnv1a_32("NetMsgSendDCM3x3"),
+}
+
+# Reverse lookup: ID -> name
+MSG_NAME = {v: k for k, v in MSG_ID.items()}
+
+
+# ---------------------------------------------------------------------------
+# Data types
+# ---------------------------------------------------------------------------
+
+class ComponentLayout(IntEnum):
+    GRAY = 0
+    RGB = 1
+    BGR = 2
+    RGBA = 3
+    BGRA = 4
+
+
+class OriginCorner(IntEnum):
+    UPPER_LEFT = 0
+    LOWER_LEFT = 1
+
+
+@dataclass
+class GCamImage:
+    width: int
+    height: int
+    num_components: int
+    bytes_per_component: int
+    is_interleaved: bool
+    comp_layout: ComponentLayout
+    origin_corner: OriginCorner
+    pixels: np.ndarray
+    timestamp_utc: str
+    frame_idx: int
+
+
+# ---------------------------------------------------------------------------
+# Serialization helpers
+# ---------------------------------------------------------------------------
+
+class NetMsgReader:
+    """Reads fields from a NetMsg payload buffer in big-endian order."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+        self._pos = 0
+
+    def read_int32(self) -> int:
+        val = struct.unpack_from(">i", self._data, self._pos)[0]
+        self._pos += 4
+        return val
+
+    def read_uint32(self) -> int:
+        val = struct.unpack_from(">I", self._data, self._pos)[0]
+        self._pos += 4
+        return val
+
+    def read_bool(self) -> bool:
+        val = self._data[self._pos]
+        self._pos += 1
+        return val != 0
+
+    def read_uchar(self) -> int:
+        val = self._data[self._pos]
+        self._pos += 1
+        return val
+
+    def read_float(self) -> float:
+        val = struct.unpack_from(">f", self._data, self._pos)[0]
+        self._pos += 4
+        return val
+
+    def read_double(self) -> float:
+        val = struct.unpack_from(">d", self._data, self._pos)[0]
+        self._pos += 8
+        return val
+
+    def read_bytes(self, n: int) -> bytes:
+        val = self._data[self._pos : self._pos + n]
+        self._pos += n
+        return val
+
+    def read_cstring(self) -> str:
+        end = self._data.index(b"\x00", self._pos)
+        val = self._data[self._pos : end].decode("utf-8")
+        self._pos = end + 1
+        return val
+
+    @property
+    def remaining(self) -> int:
+        return len(self._data) - self._pos
+
+
+class NetMsgWriter:
+    """Builds a NetMsg payload buffer in big-endian order."""
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    def write_int32(self, val: int):
+        self._buf.extend(struct.pack(">i", val))
+
+    def write_uint32(self, val: int):
+        self._buf.extend(struct.pack(">I", val))
+
+    def write_bool(self, val: bool):
+        self._buf.append(1 if val else 0)
+
+    def write_uchar(self, val: int):
+        self._buf.append(val & 0xFF)
+
+    def write_cstring(self, val: str):
+        self._buf.extend(val.encode("utf-8"))
+        self._buf.append(0)
+
+    def write_bytes(self, data: bytes):
+        self._buf.extend(data)
+
+    def to_bytes(self) -> bytes:
+        return bytes(self._buf)
+
+
+def build_netmsg(msg_name: str, payload: bytes = b"") -> bytes:
+    """Build a complete NetMsg frame: 8-byte header + payload."""
+    msg_id = MSG_ID.get(msg_name)
+    if msg_id is None:
+        msg_id = fnv1a_32(msg_name)
+    header = HEADER_STRUCT.pack(msg_id, len(payload))
+    return header + payload
+
+
+# ---------------------------------------------------------------------------
+# Message parsers
+# ---------------------------------------------------------------------------
+
+def parse_gcam_image(data: bytes) -> GCamImage:
+    r = NetMsgReader(data)
+    w = r.read_int32()
+    h = r.read_int32()
+    num_comp = r.read_int32()
+    bpc = r.read_int32()
+    is_interleaved = r.read_bool()
+    comp_layout = ComponentLayout(r.read_uchar())
+    origin_corner = OriginCorner(r.read_uchar())
+
+    pixel_size = w * h * num_comp * bpc
+    pixel_bytes = r.read_bytes(pixel_size)
+
+    timestamp = r.read_cstring()
+    frame_idx = r.read_uint32()
+
+    if bpc == 1:
+        dtype = np.uint8
+    elif bpc == 2:
+        dtype = np.uint16
+    elif bpc == 4:
+        dtype = np.float32
+    else:
+        dtype = np.uint8
+
+    pixels = np.frombuffer(pixel_bytes, dtype=dtype)
+    if is_interleaved and num_comp > 1:
+        pixels = pixels.reshape((h, w, num_comp))
+    elif num_comp == 1:
+        pixels = pixels.reshape((h, w))
+    else:
+        pixels = pixels.reshape((num_comp, h, w))
+
+    return GCamImage(
+        width=w, height=h, num_components=num_comp,
+        bytes_per_component=bpc, is_interleaved=is_interleaved,
+        comp_layout=comp_layout, origin_corner=origin_corner,
+        pixels=pixels, timestamp_utc=timestamp, frame_idx=frame_idx,
+    )
+
+
+def parse_send_string(data: bytes) -> str:
+    r = NetMsgReader(data)
+    return r.read_cstring()
+
+
+def parse_dcm3x3(data: bytes) -> np.ndarray:
+    r = NetMsgReader(data)
+    dcm = np.empty((3, 3), dtype=np.float64)
+    for row in range(3):
+        for col in range(3):
+            dcm[row, col] = r.read_double()
+    return dcm
+
+
+# ---------------------------------------------------------------------------
+# TCP stream reading
+# ---------------------------------------------------------------------------
+
+async def read_exactly(reader: asyncio.StreamReader, n: int) -> bytes:
+    """Read exactly n bytes from the stream, raising on disconnect."""
+    data = await reader.readexactly(n)
+    return data
+
+
+async def read_one_netmsg(reader: asyncio.StreamReader) -> Tuple[int, bytes]:
+    """Read one NetMsg from the TCP stream. Returns (msg_id, payload_bytes)."""
+    header = await read_exactly(reader, HEADER_SIZE)
+    msg_id, payload_len = HEADER_STRUCT.unpack(header)
+    if payload_len > 0:
+        payload = await read_exactly(reader, payload_len)
+    else:
+        payload = b""
+    return msg_id, payload
+
+
+# ---------------------------------------------------------------------------
+# AftrBurner TCP Listener
+# ---------------------------------------------------------------------------
+
+class AftrTcpListener:
+    """Receives AftrBurner NetMsg messages over TCP.
+
+    Register callbacks with `on_image`, `on_message`, etc. before calling
+    `run_server()` or `run_sink()`.
+    """
+
+    def __init__(self):
+        self._image_callbacks: List[Callable[[GCamImage], None]] = []
+        self._raw_callbacks: List[Callable[[int, bytes], None]] = []
+        self._msg_count = 0
+        self._image_count = 0
+
+    def on_image(self, callback: Callable[[GCamImage], None]):
+        self._image_callbacks.append(callback)
+
+    def on_raw_message(self, callback: Callable[[int, bytes], None]):
+        self._raw_callbacks.append(callback)
+
+    def _dispatch(self, msg_id: int, payload: bytes):
+        self._msg_count += 1
+        name = MSG_NAME.get(msg_id, f"Unknown(0x{msg_id:08X})")
+
+        if msg_id in (MSG_ID["NetMsgSend_GCam_Image"], MSG_ID["TypeA_NetMsgSend_GCam_Image"]):
+            img = parse_gcam_image(payload)
+            self._image_count += 1
+            for cb in self._image_callbacks:
+                cb(img)
+        else:
+            for cb in self._raw_callbacks:
+                cb(msg_id, payload)
+
+    async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        peer = writer.get_extra_info("peername")
+        print(f"Connection from {peer}")
+        try:
+            while True:
+                msg_id, payload = await read_one_netmsg(reader)
+                self._dispatch(msg_id, payload)
+        except (asyncio.IncompleteReadError, ConnectionError):
+            print(f"Connection closed by {peer}")
+        finally:
+            writer.close()
+
+    async def run_server(self, host: str = "0.0.0.0", port: int = 12690):
+        """Listen for incoming TCP connections from the AftrBurner engine."""
+        server = await asyncio.start_server(self._handle_connection, host, port)
+        addrs = [s.getsockname() for s in server.sockets]
+        print(f"AftrBurner TCP listener serving on {addrs}")
+        async with server:
+            await server.serve_forever()
+
+    async def run_sink(self, host: str = "127.0.0.1", port: int = 12676,
+                       subscribe_idx: int = -1):
+        """Connect to an AftrBurner ImGui_Stream_Source and receive live images."""
+        print(f"Connecting to AftrBurner Source at {host}:{port}...")
+        reader, writer = await asyncio.open_connection(host, port)
+        print(f"Connected. Sending subscription...")
+
+        # Send NetMsg_Subscribe_to_Stream_Source (payload: int32 idx)
+        w = NetMsgWriter()
+        w.write_int32(subscribe_idx)
+        writer.write(build_netmsg("NetMsg_Subscribe_to_Stream_Source", w.to_bytes()))
+        await writer.drain()
+
+        # Send NetMsg_SessionStreamMode_to_LiveStream (empty payload)
+        writer.write(build_netmsg("NetMsg_SessionStreamMode_to_LiveStream"))
+        await writer.drain()
+        print("Subscribed to live stream. Waiting for data...")
+
+        try:
+            while True:
+                msg_id, payload = await read_one_netmsg(reader)
+                self._dispatch(msg_id, payload)
+        except (asyncio.IncompleteReadError, ConnectionError):
+            print("Connection to source closed.")
+        finally:
+            writer.close()
+
+
+# ---------------------------------------------------------------------------
+# Standalone entry point
+# ---------------------------------------------------------------------------
+
+def _make_image_handler(show: bool):
+    cv2_window = None
+
+    def handler(img: GCamImage):
+        nonlocal cv2_window
+        print(f"  Image: {img.width}x{img.height} {img.comp_layout.name} "
+              f"frame={img.frame_idx} ts={img.timestamp_utc} "
+              f"pixels={img.pixels.shape} dtype={img.pixels.dtype}")
+
+        if not show:
+            return
+
+        import cv2
+        display = img.pixels
+        if img.comp_layout == ComponentLayout.RGB:
+            display = cv2.cvtColor(display, cv2.COLOR_RGB2BGR)
+        elif img.comp_layout == ComponentLayout.RGBA:
+            display = cv2.cvtColor(display, cv2.COLOR_RGBA2BGRA)
+        elif img.comp_layout == ComponentLayout.BGRA:
+            display = cv2.cvtColor(display, cv2.COLOR_BGRA2BGR)
+        if img.origin_corner == OriginCorner.LOWER_LEFT:
+            display = cv2.flip(display, 0)
+
+        if cv2_window is None:
+            cv2_window = "AftrBurner Stream"
+            cv2.namedWindow(cv2_window, cv2.WINDOW_NORMAL)
+
+        cv2.imshow(cv2_window, display)
+        cv2.waitKey(1)
+
+    return handler
+
+
+def _default_raw_handler(msg_id: int, payload: bytes):
+    name = MSG_NAME.get(msg_id, f"Unknown(0x{msg_id:08X})")
+    print(f"  NetMsg: {name} (id={msg_id}) payload={len(payload)} bytes")
+
+    if msg_id == MSG_ID.get("NetMsgSendString"):
+        print(f"    String: '{parse_send_string(payload)}'")
+    elif msg_id == MSG_ID.get("NetMsgSendDCM3x3"):
+        print(f"    DCM:\n{parse_dcm3x3(payload)}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="AftrBurner TCP Listener — receive NetMsg over TCP",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--mode", choices=["server", "sink"], default="server",
+                        help="server: listen for connections. sink: connect to a Source.")
+    parser.add_argument("--host", default="0.0.0.0",
+                        help="server: bind address. sink: source address. (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=12690,
+                        help="TCP port (default: 12690)")
+    parser.add_argument("--subscribe-idx", type=int, default=-1,
+                        help="Subscription index for sink mode (default: -1)")
+    parser.add_argument("--show", action="store_true",
+                        help="Display received images in an OpenCV window")
+    args = parser.parse_args()
+
+    listener = AftrTcpListener()
+    listener.on_image(_make_image_handler(args.show))
+    listener.on_raw_message(_default_raw_handler)
+
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    try:
+        if args.mode == "server":
+            asyncio.run(listener.run_server(args.host, args.port))
+        else:
+            asyncio.run(listener.run_sink(args.host, args.port, args.subscribe_idx))
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+
+
+if __name__ == "__main__":
+    main()
