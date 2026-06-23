@@ -355,11 +355,16 @@ class AftrTcpListener:
             await server.serve_forever()
 
     async def run_sink(self, host: str = "127.0.0.1", port: int = 12676,
-                       subscribe_idx: int = -1, step: bool = False):
+                       subscribe_idx: int = -1, step: bool = False,
+                       drain: bool = False):
         """Connect to an AftrBurner ImGui_Stream_Source and receive live images.
 
         If step=True, uses UponRequest mode — sends NetMsg_Request_Next_SensorDatum
         before each read, so the dispatch callback controls the pace.
+
+        If drain=True, after reading a message, drains any additional complete
+        messages already buffered and only dispatches the latest one.  Useful when
+        the source streams faster than the consumer can process.
         """
         print(f"Connecting to AftrBurner Source at {host}:{port}...", flush=True)
         reader, writer = await asyncio.open_connection(host, port)
@@ -388,12 +393,17 @@ class AftrTcpListener:
 
         req_next_bytes = build_netmsg("NetMsg_Request_Next_SensorDatum")
 
+        if drain:
+            await self._run_sink_drain(reader, writer, step, req_next_bytes)
+        else:
+            await self._run_sink_loop(reader, writer, step, req_next_bytes)
+
+    async def _run_sink_loop(self, reader, writer, step, req_next_bytes):
         try:
             while True:
                 if step:
                     writer.write(req_next_bytes)
                     await writer.drain()
-                    log.debug("Sent Request_Next_SensorDatum")
                 msg_id, payload = await read_one_netmsg(reader)
                 log.debug("Recv msg_id=0x%08X len=%d", msg_id, len(payload))
                 self._dispatch(msg_id, payload)
@@ -402,6 +412,49 @@ class AftrTcpListener:
         except (asyncio.IncompleteReadError, ConnectionError) as e:
             print(f"Connection to source closed: {e}", flush=True)
         finally:
+            writer.close()
+
+    async def _run_sink_drain(self, reader, writer, step, req_next_bytes):
+        """Drain mode: a background task reads messages continuously and
+        overwrites a 'latest' slot.  The main loop picks up whatever is
+        newest after each dispatch, skipping stale frames."""
+        latest = [None]          # type: List[Optional[Tuple[int, bytes]]]
+        ready = asyncio.Event()
+        reader_done = [False]
+
+        async def _reader():
+            try:
+                while True:
+                    msg = await read_one_netmsg(reader)
+                    latest[0] = msg
+                    ready.set()
+            except (asyncio.CancelledError, asyncio.IncompleteReadError,
+                    ConnectionError):
+                reader_done[0] = True
+                ready.set()
+
+        reader_task = asyncio.ensure_future(_reader())
+
+        try:
+            while True:
+                await ready.wait()
+                if reader_done[0]:
+                    break
+                ready.clear()
+                # Yield briefly so the reader task can consume any remaining
+                # buffered messages and overwrite latest with the newest one.
+                await asyncio.sleep(0.05)
+                msg_id, payload = latest[0]
+                log.debug("Recv msg_id=0x%08X len=%d", msg_id, len(payload))
+                self._dispatch(msg_id, payload)
+        except asyncio.CancelledError:
+            print("Sink task cancelled.", flush=True)
+        finally:
+            reader_task.cancel()
+            try:
+                await reader_task
+            except asyncio.CancelledError:
+                pass
             writer.close()
 
 

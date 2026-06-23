@@ -131,7 +131,8 @@ class XoFTR_AftrBridge:
         """Process a NetMsgSend_ImagePair — imgA is visible, imgB is thermal."""
         vis_bgr = gcam_to_bgr(pair.imgA)
         tir_bgr = gcam_to_bgr(pair.imgB)
-        self._run_match(vis_bgr, tir_bgr)
+        self._run_match(vis_bgr, tir_bgr,
+                        frame_a=pair.imgA.frame_idx, frame_b=pair.imgB.frame_idx)
 
     # -- Dual-sink mode ----------------------------------------------------
 
@@ -162,7 +163,7 @@ class XoFTR_AftrBridge:
         tir_bgr = self._tir_queue.popleft()
         self._run_match(vis_bgr, tir_bgr)
 
-    def _run_match(self, vis_bgr, tir_bgr):
+    def _run_match(self, vis_bgr, tir_bgr, frame_a=None, frame_b=None):
         t0 = time.perf_counter()
         result = self.matcher.from_cv_imgs(
             vis_bgr, tir_bgr,
@@ -173,8 +174,11 @@ class XoFTR_AftrBridge:
 
         self._match_count += 1
         n_matches = len(result["mkpts0"])
-        print("Match #{}: {} keypoints in {:.1f}ms".format(
-            self._match_count, n_matches, dt * 1000), flush=True)
+        frame_info = ""
+        if frame_a is not None:
+            frame_info = " [frameA={} frameB={}]".format(frame_a, frame_b)
+        print("Match #{}: {} keypoints in {:.1f}ms{}".format(
+            self._match_count, n_matches, dt * 1000, frame_info), flush=True)
 
         self._last_result = result
 
@@ -340,9 +344,11 @@ def main():
     if args.mode == "dual":
         main_coro = run_dual_sink(bridge, args.host, args.vis_port, args.tir_port)
     elif args.mode == "pair":
-        main_coro = listener.run_sink(args.host, args.port, step=args.step)
+        main_coro = listener.run_sink(args.host, args.port, step=args.step,
+                                      drain=not args.step)
     else:
-        main_coro = listener.run_sink(args.host, args.port, step=args.step)
+        main_coro = listener.run_sink(args.host, args.port, step=args.step,
+                                      drain=not args.step)
 
     main_task = loop.create_task(main_coro)
 
