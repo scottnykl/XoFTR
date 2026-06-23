@@ -1,19 +1,26 @@
 """Run XoFTR cross-modal matching on live AftrBurner image streams.
 
-Connects to two AftrBurner ImGui_Stream_Source endpoints (one visible, one
-thermal), pairs incoming frames, and runs XoFTR matching in real time.
+Primary mode — receive NetMsgSend_ImagePair (paired visible+thermal in one msg):
 
-Usage:
   python run_XoFTR_on_AftrImgPairs.py \
+      --port 12676 \
+      --ckpt weights/weights_xoftr_640.ckpt \
+      --show
+
+Dual-sink mode — two separate Source endpoints (one visible, one thermal):
+
+  python run_XoFTR_on_AftrImgPairs.py \
+      --mode dual \
       --vis_port 12676 \
       --tir_port 12698 \
       --ckpt weights/weights_xoftr_640.ckpt \
       --show
 
-  # Single stream with TypeA message differentiation (both on same port):
+Single-stream mode — TypeA message differentiation (both on same port):
+
   python run_XoFTR_on_AftrImgPairs.py \
-      --vis_port 12676 \
-      --single_stream \
+      --mode single_stream \
+      --port 12676 \
       --ckpt weights/weights_xoftr_640.ckpt \
       --show
 
@@ -22,16 +29,16 @@ Requires the xoftr conda environment (PyTorch, kornia, etc.).
 
 import asyncio
 import argparse
+import signal
 import sys
-import threading
 import time
 import cv2
 import numpy as np
-from pathlib import Path
 from collections import deque
 
 from aftr_tcp_listener import (
-    AftrTcpListener, GCamImage, ComponentLayout, OriginCorner, MSG_ID,
+    AftrTcpListener, GCamImage, ImagePair, ComponentLayout, OriginCorner,
+    MSG_ID, parse_gcam_image, _run_async,
 )
 
 
@@ -103,53 +110,59 @@ class XoFTR_AftrBridge:
     """Bridges AftrBurner image streams to XoFTR matching."""
 
     def __init__(self, matcher, K0=None, K1=None, dist0=None, dist1=None,
-                 show=False):
+                 show=False, step=False):
         self.matcher = matcher
         self.K0 = K0
         self.K1 = K1
         self.dist0 = dist0
         self.dist1 = dist1
         self.show = show
+        self.step = step
+        self._shutting_down = False
 
         self._vis_queue = deque(maxlen=2)
         self._tir_queue = deque(maxlen=2)
-        self._lock = threading.Lock()
         self._match_count = 0
         self._last_result = None
 
+    # -- ImagePair mode (primary) ------------------------------------------
+
+    def on_image_pair(self, pair: ImagePair):
+        """Process a NetMsgSend_ImagePair — imgA is visible, imgB is thermal."""
+        vis_bgr = gcam_to_bgr(pair.imgA)
+        tir_bgr = gcam_to_bgr(pair.imgB)
+        self._run_match(vis_bgr, tir_bgr)
+
+    # -- Dual-sink mode ----------------------------------------------------
+
     def on_vis_image(self, img: GCamImage):
-        bgr = gcam_to_bgr(img)
-        with self._lock:
-            self._vis_queue.append((img.frame_idx, bgr))
-        self._try_match()
+        self._vis_queue.append(gcam_to_bgr(img))
+        self._try_queued_match()
 
     def on_tir_image(self, img: GCamImage):
-        bgr = gcam_to_bgr(img)
-        with self._lock:
-            self._tir_queue.append((img.frame_idx, bgr))
-        self._try_match()
+        self._tir_queue.append(gcam_to_bgr(img))
+        self._try_queued_match()
 
-    def on_single_stream_image(self, img: GCamImage):
-        """For single-stream mode: NetMsgSend_GCam_Image = visible,
-        TypeA_NetMsgSend_GCam_Image = thermal."""
-        bgr = gcam_to_bgr(img)
-        with self._lock:
-            self._vis_queue.append((img.frame_idx, bgr))
-        self._try_match()
+    # -- Single-stream mode ------------------------------------------------
 
-    def on_single_stream_image_typeA(self, img: GCamImage):
-        bgr = gcam_to_bgr(img)
-        with self._lock:
-            self._tir_queue.append((img.frame_idx, bgr))
-        self._try_match()
+    def on_single_stream_vis(self, img: GCamImage):
+        self._vis_queue.append(gcam_to_bgr(img))
+        self._try_queued_match()
 
-    def _try_match(self):
-        with self._lock:
-            if not self._vis_queue or not self._tir_queue:
-                return
-            _, vis_bgr = self._vis_queue.popleft()
-            _, tir_bgr = self._tir_queue.popleft()
+    def on_single_stream_tir(self, img: GCamImage):
+        self._tir_queue.append(gcam_to_bgr(img))
+        self._try_queued_match()
 
+    # -- Internals ---------------------------------------------------------
+
+    def _try_queued_match(self):
+        if not self._vis_queue or not self._tir_queue:
+            return
+        vis_bgr = self._vis_queue.popleft()
+        tir_bgr = self._tir_queue.popleft()
+        self._run_match(vis_bgr, tir_bgr)
+
+    def _run_match(self, vis_bgr, tir_bgr):
         t0 = time.perf_counter()
         result = self.matcher.from_cv_imgs(
             vis_bgr, tir_bgr,
@@ -161,7 +174,7 @@ class XoFTR_AftrBridge:
         self._match_count += 1
         n_matches = len(result["mkpts0"])
         print("Match #{}: {} keypoints in {:.1f}ms".format(
-            self._match_count, n_matches, dt * 1000))
+            self._match_count, n_matches, dt * 1000), flush=True)
 
         self._last_result = result
 
@@ -171,7 +184,25 @@ class XoFTR_AftrBridge:
                 result["mkpts0"], result["mkpts1"], result["mconf"],
             )
             cv2.imshow("XoFTR Matches", canvas)
-            cv2.waitKey(1)
+            if self.step:
+                print("Press any key in the image window for next pair...", flush=True)
+                while cv2.waitKey(100) == -1:
+                    if self._shutting_down:
+                        return
+            else:
+                cv2.waitKey(1)
+
+
+# ---------------------------------------------------------------------------
+# Async entry points
+# ---------------------------------------------------------------------------
+
+async def run_pair_sink(bridge, host, port):
+    """Connect to a Source streaming NetMsgSend_ImagePair messages."""
+    listener = AftrTcpListener()
+    listener.on_image_pair(bridge.on_image_pair)
+    print("Connecting to ImagePair stream on {}:{}...".format(host, port), flush=True)
+    await listener.run_sink(host, port)
 
 
 async def run_dual_sink(bridge, host, vis_port, tir_port):
@@ -182,41 +213,35 @@ async def run_dual_sink(bridge, host, vis_port, tir_port):
     vis_listener.on_image(bridge.on_vis_image)
     tir_listener.on_image(bridge.on_tir_image)
 
-    vis_task = asyncio.create_task(
-        vis_listener.run_sink(host, vis_port))
-    tir_task = asyncio.create_task(
-        tir_listener.run_sink(host, tir_port))
-
-    print("Connecting to visible stream on port {} and thermal stream on port {}...".format(
-        vis_port, tir_port))
-    await asyncio.gather(vis_task, tir_task)
+    print("Connecting to visible on port {} and thermal on port {}...".format(
+        vis_port, tir_port), flush=True)
+    await asyncio.gather(
+        vis_listener.run_sink(host, vis_port),
+        tir_listener.run_sink(host, tir_port),
+    )
 
 
 async def run_single_sink(bridge, host, port):
     """Connect to one Source, differentiate by message type."""
     listener = AftrTcpListener()
 
-    # Override dispatch to separate NetMsgSend_GCam_Image vs TypeA
-    original_dispatch = listener._dispatch
-
     def custom_dispatch(msg_id, payload):
-        from aftr_tcp_listener import parse_gcam_image
         if msg_id == MSG_ID["NetMsgSend_GCam_Image"]:
-            img = parse_gcam_image(payload)
-            bridge.on_single_stream_image(img)
+            bridge.on_single_stream_vis(parse_gcam_image(payload))
         elif msg_id == MSG_ID["TypeA_NetMsgSend_GCam_Image"]:
-            img = parse_gcam_image(payload)
-            bridge.on_single_stream_image_typeA(img)
+            bridge.on_single_stream_tir(parse_gcam_image(payload))
         else:
             listener._msg_count += 1
-            for cb in listener._raw_callbacks:
-                cb(msg_id, payload)
 
     listener._dispatch = custom_dispatch
 
-    print("Connecting to single stream on port {}...".format(port))
+    print("Connecting to single stream on port {}...".format(port), flush=True)
     await listener.run_sink(host, port)
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
@@ -224,15 +249,19 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    parser.add_argument("--mode", choices=["pair", "dual", "single_stream"],
+                        default="pair",
+                        help="pair: NetMsgSend_ImagePair on one port (default). "
+                             "dual: two separate Source ports. "
+                             "single_stream: TypeA differentiation on one port.")
     parser.add_argument("--host", default="127.0.0.1",
                         help="AftrBurner Source host (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=12676,
+                        help="TCP port for pair/single_stream mode (default: 12676)")
     parser.add_argument("--vis_port", type=int, default=12676,
-                        help="TCP port for visible image stream (default: 12676)")
+                        help="TCP port for visible stream in dual mode (default: 12676)")
     parser.add_argument("--tir_port", type=int, default=12698,
-                        help="TCP port for thermal image stream (default: 12698)")
-    parser.add_argument("--single_stream", action="store_true",
-                        help="Both image types on one port (NetMsgSend_GCam_Image=vis, "
-                             "TypeA=tir). Only --vis_port is used.")
+                        help="TCP port for thermal stream in dual mode (default: 12698)")
     parser.add_argument("--ckpt", default="weights/weights_xoftr_640.ckpt",
                         help="XoFTR checkpoint path (default: weights/weights_xoftr_640.ckpt)")
     parser.add_argument("--match_threshold", type=float, default=0.3,
@@ -241,12 +270,16 @@ def main():
                         help="Fine matching threshold (default: 0.1)")
     parser.add_argument("--show", action="store_true",
                         help="Display match visualization in an OpenCV window")
-
-    # Optional calibration (if not provided, no undistortion is applied)
+    parser.add_argument("--step", action="store_true",
+                        help="Step-through mode: process one pair at a time, "
+                             "wait for keypress before next (implies --show)")
     parser.add_argument("--calib", default=None,
                         help="Path to calibration YAML (same format as create_scene_npz.py)")
 
     args = parser.parse_args()
+
+    if args.step:
+        args.show = True
 
     # Load calibration if provided
     K0, K1, dist0, dist1 = None, None, None, None
@@ -257,31 +290,89 @@ def main():
         K1 = calib["thermal"]["K"].astype(np.float32)
         dist0 = calib["visible"]["dist"]
         dist1 = calib["thermal"]["dist"]
-        print("Loaded calibration from {}".format(args.calib))
+        print("Loaded calibration from {}".format(args.calib), flush=True)
 
-    print("Loading XoFTR from {}...".format(args.ckpt))
+    print("Loading XoFTR from {}...".format(args.ckpt), flush=True)
     matcher = load_xoftr(args.ckpt, args.match_threshold, args.fine_threshold)
-    print("XoFTR loaded.")
+    print("XoFTR loaded.", flush=True)
 
     bridge = XoFTR_AftrBridge(
-        matcher, K0=K0, K1=K1, dist0=dist0, dist1=dist1, show=args.show,
+        matcher, K0=K0, K1=K1, dist0=dist0, dist1=dist1,
+        show=args.show, step=args.step,
     )
 
     if args.show:
         cv2.namedWindow("XoFTR Matches", cv2.WINDOW_NORMAL)
 
+    # Build the async coroutine for the selected mode
+    # We reuse _run_async from aftr_tcp_listener for proper Ctrl+C on Windows
+    class _Args:
+        pass
+    run_args = _Args()
+    run_args.mode = "sink"
+    run_args.host = args.host
+    run_args.subscribe_idx = -1
+
+    if args.mode == "pair":
+        run_args.port = args.port
+        listener = AftrTcpListener()
+        listener.on_image_pair(bridge.on_image_pair)
+    elif args.mode == "dual":
+        # For dual mode we build a custom listener and override run
+        listener = None
+    elif args.mode == "single_stream":
+        run_args.port = args.port
+        listener = AftrTcpListener()
+        def custom_dispatch(msg_id, payload):
+            if msg_id == MSG_ID["NetMsgSend_GCam_Image"]:
+                bridge.on_single_stream_vis(parse_gcam_image(payload))
+            elif msg_id == MSG_ID["TypeA_NetMsgSend_GCam_Image"]:
+                bridge.on_single_stream_tir(parse_gcam_image(payload))
+        listener._dispatch = custom_dispatch
+
+    # Run with proper Ctrl+C handling
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    if args.mode == "dual":
+        main_coro = run_dual_sink(bridge, args.host, args.vis_port, args.tir_port)
+    elif args.mode == "pair":
+        main_coro = listener.run_sink(args.host, args.port, step=args.step)
+    else:
+        main_coro = listener.run_sink(args.host, args.port, step=args.step)
+
+    main_task = loop.create_task(main_coro)
+
+    async def _keepalive():
+        while True:
+            await asyncio.sleep(0.2)
+
+    keepalive_task = loop.create_task(_keepalive())
+
+    def _shutdown(signum=None, frame=None):
+        print("\nCtrl+C received, shutting down...", flush=True)
+        bridge._shutting_down = True
+        main_task.cancel()
+        keepalive_task.cancel()
+
+    signal.signal(signal.SIGINT, _shutdown)
+
     try:
-        if args.single_stream:
-            asyncio.run(run_single_sink(bridge, args.host, args.vis_port))
-        else:
-            asyncio.run(run_dual_sink(bridge, args.host, args.vis_port, args.tir_port))
-    except KeyboardInterrupt:
-        print("\nShutting down.")
+        loop.run_until_complete(main_task)
+    except asyncio.CancelledError:
+        pass
     finally:
+        keepalive_task.cancel()
+        try:
+            loop.run_until_complete(keepalive_task)
+        except asyncio.CancelledError:
+            pass
+        loop.close()
         cv2.destroyAllWindows()
+        print("Done.", flush=True)
 
 
 if __name__ == "__main__":

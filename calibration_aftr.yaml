@@ -1,0 +1,17 @@
+# AftrBurner camera calibration for XoFTR.
+# camA = visible (imgA in NetMsgSend_ImagePair)
+# camB = thermal (imgB in NetMsgSend_ImagePair)
+
+visible:
+  fx: 926.42715069678229
+  fy: 926.42715069678229
+  cx: 432.0
+  cy: 432.0
+  dist: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+thermal:
+  fx: 926.42715069678229
+  fy: 926.42715069678229
+  cx: 432.0
+  cy: 432.0
+  dist: [0.0, 0.0, 0.0, 0.0, 0.0]

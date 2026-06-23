@@ -60,6 +60,7 @@ MSG_ID = {
     "NetMsg_Request_Next_SensorDatum": fnv1a_32("NetMsg_Request_Next_SensorDatum"),
     "NetMsgSendString": fnv1a_32("NetMsgSendString"),
     "NetMsgSendDCM3x3": fnv1a_32("NetMsgSendDCM3x3"),
+    "NetMsgSend_ImagePair": fnv1a_32("NetMsgSend_ImagePair"),
 }
 
 # Reverse lookup: ID -> name
@@ -95,6 +96,12 @@ class GCamImage:
     pixels: np.ndarray
     timestamp_utc: str
     frame_idx: int
+
+
+@dataclass
+class ImagePair:
+    imgA: GCamImage
+    imgB: GCamImage
 
 
 # ---------------------------------------------------------------------------
@@ -196,8 +203,8 @@ def build_netmsg(msg_name: str, payload: bytes = b"") -> bytes:
 # Message parsers
 # ---------------------------------------------------------------------------
 
-def parse_gcam_image(data: bytes) -> GCamImage:
-    r = NetMsgReader(data)
+def _parse_gcam_from_reader(r: NetMsgReader) -> GCamImage:
+    """Parse one GCamImage (image + timestamp + frameIdx) from a reader."""
     w = r.read_int32()
     h = r.read_int32()
     num_comp = r.read_int32()
@@ -235,6 +242,17 @@ def parse_gcam_image(data: bytes) -> GCamImage:
         comp_layout=comp_layout, origin_corner=origin_corner,
         pixels=pixels, timestamp_utc=timestamp, frame_idx=frame_idx,
     )
+
+
+def parse_gcam_image(data: bytes) -> GCamImage:
+    return _parse_gcam_from_reader(NetMsgReader(data))
+
+
+def parse_image_pair(data: bytes) -> ImagePair:
+    r = NetMsgReader(data)
+    imgA = _parse_gcam_from_reader(r)
+    imgB = _parse_gcam_from_reader(r)
+    return ImagePair(imgA=imgA, imgB=imgB)
 
 
 def parse_send_string(data: bytes) -> str:
@@ -285,6 +303,7 @@ class AftrTcpListener:
 
     def __init__(self):
         self._image_callbacks: List[Callable[[GCamImage], None]] = []
+        self._pair_callbacks: List[Callable[[ImagePair], None]] = []
         self._raw_callbacks: List[Callable[[int, bytes], None]] = []
         self._msg_count = 0
         self._image_count = 0
@@ -292,18 +311,25 @@ class AftrTcpListener:
     def on_image(self, callback: Callable[[GCamImage], None]):
         self._image_callbacks.append(callback)
 
+    def on_image_pair(self, callback: Callable[[ImagePair], None]):
+        self._pair_callbacks.append(callback)
+
     def on_raw_message(self, callback: Callable[[int, bytes], None]):
         self._raw_callbacks.append(callback)
 
     def _dispatch(self, msg_id: int, payload: bytes):
         self._msg_count += 1
-        name = MSG_NAME.get(msg_id, f"Unknown(0x{msg_id:08X})")
 
         if msg_id in (MSG_ID["NetMsgSend_GCam_Image"], MSG_ID["TypeA_NetMsgSend_GCam_Image"]):
             img = parse_gcam_image(payload)
             self._image_count += 1
             for cb in self._image_callbacks:
                 cb(img)
+        elif msg_id == MSG_ID["NetMsgSend_ImagePair"]:
+            pair = parse_image_pair(payload)
+            self._image_count += 2
+            for cb in self._pair_callbacks:
+                cb(pair)
         else:
             for cb in self._raw_callbacks:
                 cb(msg_id, payload)
@@ -329,8 +355,12 @@ class AftrTcpListener:
             await server.serve_forever()
 
     async def run_sink(self, host: str = "127.0.0.1", port: int = 12676,
-                       subscribe_idx: int = -1):
-        """Connect to an AftrBurner ImGui_Stream_Source and receive live images."""
+                       subscribe_idx: int = -1, step: bool = False):
+        """Connect to an AftrBurner ImGui_Stream_Source and receive live images.
+
+        If step=True, uses UponRequest mode — sends NetMsg_Request_Next_SensorDatum
+        before each read, so the dispatch callback controls the pace.
+        """
         print(f"Connecting to AftrBurner Source at {host}:{port}...", flush=True)
         reader, writer = await asyncio.open_connection(host, port)
         print(f"Connected to {host}:{port}.", flush=True)
@@ -344,15 +374,26 @@ class AftrTcpListener:
         log.debug("Sent Subscribe (%d bytes): %s", len(sub_bytes), sub_bytes.hex())
         print(f"Sent subscription (idx={subscribe_idx}).", flush=True)
 
-        # Send NetMsg_SessionStreamMode_to_LiveStream (empty payload)
-        live_bytes = build_netmsg("NetMsg_SessionStreamMode_to_LiveStream")
-        writer.write(live_bytes)
-        await writer.drain()
-        log.debug("Sent LiveStream (%d bytes): %s", len(live_bytes), live_bytes.hex())
-        print("Sent live stream request. Waiting for data...", flush=True)
+        if step:
+            upon_req_bytes = build_netmsg("NetMsg_SessionStreamMode_to_UponRequest")
+            writer.write(upon_req_bytes)
+            await writer.drain()
+            print("Sent UponRequest stream mode. Step-through active.", flush=True)
+        else:
+            live_bytes = build_netmsg("NetMsg_SessionStreamMode_to_LiveStream")
+            writer.write(live_bytes)
+            await writer.drain()
+            log.debug("Sent LiveStream (%d bytes): %s", len(live_bytes), live_bytes.hex())
+            print("Sent live stream request. Waiting for data...", flush=True)
+
+        req_next_bytes = build_netmsg("NetMsg_Request_Next_SensorDatum")
 
         try:
             while True:
+                if step:
+                    writer.write(req_next_bytes)
+                    await writer.drain()
+                    log.debug("Sent Request_Next_SensorDatum")
                 msg_id, payload = await read_one_netmsg(reader)
                 log.debug("Recv msg_id=0x%08X len=%d", msg_id, len(payload))
                 self._dispatch(msg_id, payload)
@@ -401,6 +442,59 @@ def _make_image_handler(show: bool):
     return handler
 
 
+def _make_pair_handler(show: bool):
+    cv2_window = None
+
+    def handler(pair: ImagePair):
+        nonlocal cv2_window
+        a, b = pair.imgA, pair.imgB
+        print(f"  ImagePair: A={a.width}x{a.height} {a.comp_layout.name} frame={a.frame_idx} "
+              f"| B={b.width}x{b.height} {b.comp_layout.name} frame={b.frame_idx}", flush=True)
+
+        if not show:
+            return
+
+        import cv2
+
+        def to_display(img):
+            d = img.pixels
+            if img.comp_layout == ComponentLayout.RGB:
+                d = cv2.cvtColor(d, cv2.COLOR_RGB2BGR)
+            elif img.comp_layout == ComponentLayout.RGBA:
+                d = cv2.cvtColor(d, cv2.COLOR_RGBA2BGRA)
+            elif img.comp_layout == ComponentLayout.BGRA:
+                d = cv2.cvtColor(d, cv2.COLOR_BGRA2BGR)
+            elif img.comp_layout == ComponentLayout.GRAY:
+                d = cv2.cvtColor(d, cv2.COLOR_GRAY2BGR)
+            if img.origin_corner == OriginCorner.LOWER_LEFT:
+                d = cv2.flip(d, 0)
+            return d
+
+        dispA = to_display(a)
+        dispB = to_display(b)
+
+        hA, wA = dispA.shape[:2]
+        hB, wB = dispB.shape[:2]
+        h = max(hA, hB)
+        if hA != h:
+            dispA = cv2.resize(dispA, (int(wA * h / hA), h))
+        if hB != h:
+            dispB = cv2.resize(dispB, (int(wB * h / hB), h))
+
+        canvas = np.hstack([dispA, dispB])
+        cv2.putText(canvas, "A", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(canvas, "B", (dispA.shape[1] + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        if cv2_window is None:
+            cv2_window = "AftrBurner ImagePair"
+            cv2.namedWindow(cv2_window, cv2.WINDOW_NORMAL)
+
+        cv2.imshow(cv2_window, canvas)
+        cv2.waitKey(1)
+
+    return handler
+
+
 def _default_raw_handler(msg_id: int, payload: bytes):
     name = MSG_NAME.get(msg_id, f"Unknown(0x{msg_id:08X})")
     print(f"  NetMsg: {name} (id={msg_id}) payload={len(payload)} bytes", flush=True)
@@ -438,6 +532,7 @@ def main():
 
     listener = AftrTcpListener()
     listener.on_image(_make_image_handler(args.show))
+    listener.on_image_pair(_make_pair_handler(args.show))
     listener.on_raw_message(_default_raw_handler)
 
     _run_async(listener, args)
