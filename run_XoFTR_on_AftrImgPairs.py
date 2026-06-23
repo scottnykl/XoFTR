@@ -42,6 +42,37 @@ from aftr_tcp_listener import (
 )
 
 
+def estimate_relative_pose(mkpts0, mkpts1, K0, K1, thresh=0.5, conf=0.99999):
+    """Estimate relative pose from matched keypoints and intrinsics.
+
+    Returns (yaw_deg, pitch_deg, roll_deg, t_user, n_inliers) in user coords
+    (X=forward, Y=left, Z=up), or None if estimation fails.
+    """
+    from src.utils.metrics import estimate_pose
+
+    ret = estimate_pose(mkpts0, mkpts1, K0, K1, thresh, conf)
+    if ret is None:
+        return None
+
+    R_cv, t_cv, inliers = ret
+
+    # OpenCV camera coords: X=right, Y=down, Z=forward
+    # User coords:          X=forward, Y=left, Z=up
+    C = np.array([[0, 0, 1],
+                  [-1, 0, 0],
+                  [0, -1, 0]], dtype=np.float64)
+
+    R_user = C @ R_cv @ C.T
+    t_user = C @ t_cv
+
+    # Extract YPR from R = Rx(roll) * Ry(pitch) * Rz(yaw)
+    pitch = np.degrees(np.arcsin(np.clip(R_user[0, 2], -1.0, 1.0)))
+    yaw = np.degrees(np.arctan2(-R_user[0, 1], R_user[0, 0]))
+    roll = np.degrees(np.arctan2(-R_user[1, 2], R_user[2, 2]))
+
+    return yaw, pitch, roll, t_user, int(np.sum(inliers))
+
+
 def load_xoftr(ckpt_path, match_threshold=0.3, fine_threshold=0.1):
     from src.xoftr import XoFTR
     from src.config.default import get_cfg_defaults
@@ -110,7 +141,7 @@ class XoFTR_AftrBridge:
     """Bridges AftrBurner image streams to XoFTR matching."""
 
     def __init__(self, matcher, K0=None, K1=None, dist0=None, dist1=None,
-                 show=False, step=False):
+                 show=False, step=False, top_k=None):
         self.matcher = matcher
         self.K0 = K0
         self.K1 = K1
@@ -118,6 +149,7 @@ class XoFTR_AftrBridge:
         self.dist1 = dist1
         self.show = show
         self.step = step
+        self.top_k = top_k
         self._shutting_down = False
 
         self._vis_queue = deque(maxlen=2)
@@ -172,6 +204,13 @@ class XoFTR_AftrBridge:
         )
         dt = time.perf_counter() - t0
 
+        if self.top_k is not None and len(result["mkpts0"]) > self.top_k:
+            top_idx = np.argsort(result["mconf"])[-self.top_k:]
+            result["mkpts0"] = result["mkpts0"][top_idx]
+            result["mkpts1"] = result["mkpts1"][top_idx]
+            result["mconf"] = result["mconf"][top_idx]
+            result["matches"] = result["matches"][top_idx]
+
         self._match_count += 1
         n_matches = len(result["mkpts0"])
         frame_info = ""
@@ -182,11 +221,46 @@ class XoFTR_AftrBridge:
 
         self._last_result = result
 
+        pose_lines = []
+        if self.K0 is not None and self.K1 is not None:
+            pose_K0 = result.get("new_K0", self.K0).astype(np.float64)
+            pose_K1 = result.get("new_K1", self.K1).astype(np.float64)
+            pose = estimate_relative_pose(
+                result["mkpts0"], result["mkpts1"], pose_K0, pose_K1)
+            if pose is not None:
+                yaw, pitch, roll, t, n_inl = pose
+                print("  YPR: ({:.2f} {:.2f} {:.2f})  T: ({:.3f} {:.3f} {:.3f})  inliers: {}".format(
+                    yaw, pitch, roll, t[0], t[1], t[2], n_inl), flush=True)
+                pose_lines.append("YPR: ({:.2f} {:.2f} {:.2f})".format(yaw, pitch, roll))
+                pose_lines.append("T: ({:.3f} {:.3f} {:.3f})".format(t[0], t[1], t[2]))
+                pose_lines.append("inliers: {}".format(n_inl))
+            else:
+                print("  Pose estimation failed (< 5 matches or degenerate)", flush=True)
+
         if self.show:
             canvas = draw_matches(
                 vis_bgr, tir_bgr,
                 result["mkpts0"], result["mkpts1"], result["mconf"],
             )
+            if pose_lines:
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                scale = 0.6
+                thickness = 2
+                margin = 10
+                line_h = 28
+                max_w = max(cv2.getTextSize(l, font, scale, thickness)[0][0]
+                           for l in pose_lines)
+                ch, cw = canvas.shape[:2]
+                x0 = cw - max_w - margin
+                y0 = ch - margin - line_h * len(pose_lines)
+                cv2.rectangle(canvas,
+                              (x0 - 6, y0 - 20),
+                              (cw - margin + 6, ch - margin + 6),
+                              (0, 0, 0), -1)
+                for i, line in enumerate(pose_lines):
+                    cv2.putText(canvas, line,
+                                (x0, y0 + i * line_h),
+                                font, scale, (0, 255, 255), thickness, cv2.LINE_AA)
             cv2.imshow("XoFTR Matches", canvas)
             if self.step:
                 print("Press any key in the image window for next pair...", flush=True)
@@ -277,6 +351,8 @@ def main():
     parser.add_argument("--step", action="store_true",
                         help="Step-through mode: process one pair at a time, "
                              "wait for keypress before next (implies --show)")
+    parser.add_argument("--top_k", type=int, default=None,
+                        help="Use and display only the top K matches by confidence")
     parser.add_argument("--calib", default=None,
                         help="Path to calibration YAML (same format as create_scene_npz.py)")
 
@@ -302,7 +378,7 @@ def main():
 
     bridge = XoFTR_AftrBridge(
         matcher, K0=K0, K1=K1, dist0=dist0, dist1=dist1,
-        show=args.show, step=args.step,
+        show=args.show, step=args.step, top_k=args.top_k,
     )
 
     if args.show:
@@ -344,11 +420,9 @@ def main():
     if args.mode == "dual":
         main_coro = run_dual_sink(bridge, args.host, args.vis_port, args.tir_port)
     elif args.mode == "pair":
-        main_coro = listener.run_sink(args.host, args.port, step=args.step,
-                                      drain=not args.step)
+        main_coro = listener.run_sink(args.host, args.port, step=True)
     else:
-        main_coro = listener.run_sink(args.host, args.port, step=args.step,
-                                      drain=not args.step)
+        main_coro = listener.run_sink(args.host, args.port, step=True)
 
     main_task = loop.create_task(main_coro)
 
