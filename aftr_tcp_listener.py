@@ -61,6 +61,7 @@ MSG_ID = {
     "NetMsgSendString": fnv1a_32("NetMsgSendString"),
     "NetMsgSendDCM3x3": fnv1a_32("NetMsgSendDCM3x3"),
     "NetMsgSend_ImagePair": fnv1a_32("NetMsgSend_ImagePair"),
+    "NetMsg_2D_to_2D_InferenceResult": fnv1a_32("NetMsg_2D_to_2D_InferenceResult"),
 }
 
 # Reverse lookup: ID -> name
@@ -183,6 +184,9 @@ class NetMsgWriter:
         self._buf.extend(val.encode("utf-8"))
         self._buf.append(0)
 
+    def write_float(self, val: float):
+        self._buf.extend(struct.pack(">f", val))
+
     def write_bytes(self, data: bytes):
         self._buf.extend(data)
 
@@ -197,6 +201,28 @@ def build_netmsg(msg_name: str, payload: bytes = b"") -> bytes:
         msg_id = fnv1a_32(msg_name)
     header = HEADER_STRUCT.pack(msg_id, len(payload))
     return header + payload
+
+
+def build_inference_result(frame_idx: int, time_utc: str, matches) -> bytes:
+    """Build a NetMsg_2D_to_2D_InferenceResult frame.
+
+    Args:
+        frame_idx: Frame index relayed from the received image pair.
+        time_utc: UTC time string relayed from the received image pair.
+        matches: Iterable of (ua, va, ub, vb, conf) tuples sorted by
+                 descending confidence.
+    """
+    w = NetMsgWriter()
+    w.write_uint32(frame_idx)
+    w.write_cstring(time_utc)
+    w.write_uint32(len(matches))
+    for ua, va, ub, vb, conf in matches:
+        w.write_float(ua)
+        w.write_float(va)
+        w.write_float(ub)
+        w.write_float(vb)
+        w.write_float(conf)
+    return build_netmsg("NetMsg_2D_to_2D_InferenceResult", w.to_bytes())
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +333,7 @@ class AftrTcpListener:
         self._raw_callbacks: List[Callable[[int, bytes], None]] = []
         self._msg_count = 0
         self._image_count = 0
+        self.writer: Optional[asyncio.StreamWriter] = None
 
     def on_image(self, callback: Callable[[GCamImage], None]):
         self._image_callbacks.append(callback)
@@ -368,6 +395,7 @@ class AftrTcpListener:
         """
         print(f"Connecting to AftrBurner Source at {host}:{port}...", flush=True)
         reader, writer = await asyncio.open_connection(host, port)
+        self.writer = writer
         print(f"Connected to {host}:{port}.", flush=True)
 
         # Send NetMsg_Subscribe_to_Stream_Source (payload: int32 idx)

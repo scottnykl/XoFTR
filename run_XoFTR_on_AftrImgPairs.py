@@ -38,7 +38,7 @@ from collections import deque
 
 from aftr_tcp_listener import (
     AftrTcpListener, GCamImage, ImagePair, ComponentLayout, OriginCorner,
-    MSG_ID, parse_gcam_image, _run_async,
+    MSG_ID, parse_gcam_image, _run_async, build_inference_result,
 )
 
 
@@ -141,7 +141,7 @@ class XoFTR_AftrBridge:
     """Bridges AftrBurner image streams to XoFTR matching."""
 
     def __init__(self, matcher, K0=None, K1=None, dist0=None, dist1=None,
-                 show=False, step=False, top_k=None):
+                 show=False, step=False, top_k=None, listener=None):
         self.matcher = matcher
         self.K0 = K0
         self.K1 = K1
@@ -150,6 +150,7 @@ class XoFTR_AftrBridge:
         self.show = show
         self.step = step
         self.top_k = top_k
+        self.listener = listener
         self._shutting_down = False
 
         self._vis_queue = deque(maxlen=2)
@@ -164,7 +165,10 @@ class XoFTR_AftrBridge:
         vis_bgr = gcam_to_bgr(pair.imgA)
         tir_bgr = gcam_to_bgr(pair.imgB)
         self._run_match(vis_bgr, tir_bgr,
-                        frame_a=pair.imgA.frame_idx, frame_b=pair.imgB.frame_idx)
+                        frame_a=pair.imgA.frame_idx, frame_b=pair.imgB.frame_idx,
+                        time_utc_a=pair.imgA.timestamp_utc,
+                        orig_w_a=pair.imgA.width, orig_h_a=pair.imgA.height,
+                        orig_w_b=pair.imgB.width, orig_h_b=pair.imgB.height)
 
     # -- Dual-sink mode ----------------------------------------------------
 
@@ -188,6 +192,42 @@ class XoFTR_AftrBridge:
 
     # -- Internals ---------------------------------------------------------
 
+    def _send_inference_result(self, result, frame_idx, time_utc,
+                               orig_w_a, orig_h_a, orig_w_b, orig_h_b):
+        """Normalize keypoints to [0,1] and send back to AftrBurner."""
+        if self.listener is None:
+            print("  [InferenceResult] skipped: listener is None", flush=True)
+            return
+        if self.listener.writer is None:
+            print("  [InferenceResult] skipped: listener.writer is None", flush=True)
+            return
+        if frame_idx is None or time_utc is None:
+            print("  [InferenceResult] skipped: frame_idx={} time_utc={}".format(
+                frame_idx, time_utc), flush=True)
+            return
+
+        mkpts0 = result["mkpts0"]
+        mkpts1 = result["mkpts1"]
+        mconf = result["mconf"]
+        n = len(mkpts0)
+        if n == 0:
+            return
+
+        order = np.argsort(mconf)[::-1]
+
+        matches = []
+        for i in order:
+            ua = float(mkpts0[i, 0]) / orig_w_a
+            va = float(mkpts0[i, 1]) / orig_h_a
+            ub = float(mkpts1[i, 0]) / orig_w_b
+            vb = float(mkpts1[i, 1]) / orig_h_b
+            matches.append((ua, va, ub, vb, float(mconf[i])))
+
+        msg_bytes = build_inference_result(frame_idx, time_utc, matches)
+        self.listener.writer.write(msg_bytes)
+        print("  Sent {} matches back to AftrBurner (frame {})".format(
+            len(matches), frame_idx), flush=True)
+
     def _try_queued_match(self):
         if not self._vis_queue or not self._tir_queue:
             return
@@ -195,7 +235,9 @@ class XoFTR_AftrBridge:
         tir_bgr = self._tir_queue.popleft()
         self._run_match(vis_bgr, tir_bgr)
 
-    def _run_match(self, vis_bgr, tir_bgr, frame_a=None, frame_b=None):
+    def _run_match(self, vis_bgr, tir_bgr, frame_a=None, frame_b=None,
+                   time_utc_a=None, orig_w_a=None, orig_h_a=None,
+                   orig_w_b=None, orig_h_b=None):
         t0 = time.perf_counter()
         result = self.matcher.from_cv_imgs(
             vis_bgr, tir_bgr,
@@ -220,6 +262,10 @@ class XoFTR_AftrBridge:
             self._match_count, n_matches, dt * 1000, frame_info), flush=True)
 
         self._last_result = result
+
+        self._send_inference_result(
+            result, frame_a, time_utc_a,
+            orig_w_a, orig_h_a, orig_w_b, orig_h_b)
 
         pose_lines = []
         if self.K0 is not None and self.K1 is not None:
@@ -396,6 +442,7 @@ def main():
     if args.mode == "pair":
         run_args.port = args.port
         listener = AftrTcpListener()
+        bridge.listener = listener
         listener.on_image_pair(bridge.on_image_pair)
     elif args.mode == "dual":
         # For dual mode we build a custom listener and override run
@@ -403,6 +450,7 @@ def main():
     elif args.mode == "single_stream":
         run_args.port = args.port
         listener = AftrTcpListener()
+        bridge.listener = listener
         def custom_dispatch(msg_id, payload):
             if msg_id == MSG_ID["NetMsgSend_GCam_Image"]:
                 bridge.on_single_stream_vis(parse_gcam_image(payload))
