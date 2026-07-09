@@ -27,3 +27,44 @@ Keep the Essential matrix approach but recover scale using known distances:
 Simpler to implement but less robust — depends on picking good point pairs.
 
 My recommendation: Option 1 (PnP) is what you'd use in a real AAR system. It directly gives you imageA's pose in the tanker's reference frame. The prerequisite is being able to map imageB keypoints to 3D aircraft coordinates — how are you planning to establish that? Do you have a textured 3D mesh of the aircraft, or known fiducial/feature locations?
+
+
+### Export XoFTR Env
+Step 1: Export the environment on your desktop (run in Anaconda Prompt or PowerShell)
+
+# Export full spec including pip-installed packages
+conda run -p "C:\Users\scott\anaconda3\envs\xoftr" pip list --format=freeze > pip_requirements.txt
+
+# Export the conda environment (exclude pip packages; they have separate requirements)
+conda env export -p "C:\Users\scott\anaconda3\envs\xoftr" --no-builds > environment_export.yaml
+
+The --no-builds flag strips platform-specific build strings so it's more portable.
+
+Step 2: Transfer files to the laptop
+
+Copy these to the laptop:
+- environment_export.yaml
+- pip_requirements.txt
+- weights/ directory
+- data/ directory (if needed)
+- The repo itself
+
+Step 3: Recreate on the laptop
+
+# Create the env from the yaml
+conda env create -n xoftr -f environment_export.yaml
+
+# Activate it
+conda activate xoftr
+
+# Reinstall PyTorch via pip (same fix as desktop — avoids the broken conda DLLs)
+pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
+
+# Install any remaining pip packages (skip torch lines since you just did those)
+pip install -r pip_requirements.txt
+
+▎ Note: The pip wheel approach (cu118) should work on the laptop even if it has a different CUDA version on the system PATH — the wheel bundles its own CUDA 11.8 DLLs. The laptop just needs an NVIDIA GPU with a driver that supports CUDA 11.8+ (driver version ≥ 452.39).
+
+Want me to generate the export commands as a script you can run directly?
+
+result: Instructions for exporting and recreating the XoFTR conda environment on a second Windows 11 laptop, including the PyTorch pip-wheel fix that was needed on the desktop.
