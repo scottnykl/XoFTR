@@ -18,6 +18,12 @@ Received images are stored as numpy arrays and can be accessed via callbacks.
 Run standalone to see incoming messages printed to the console.
 """
 
+import os
+# Intel's OpenMP/MKL runtime (bundled with numpy/torch on Windows) installs
+# its own Console Control Handler and swallows CTRL_C_EVENT before Python's
+# SIGINT handler ever sees it. Must be set before numpy is imported (below).
+os.environ.setdefault("FOR_DISABLE_CONSOLE_CTRL_HANDLER", "1")
+
 import asyncio
 import struct
 import numpy as np
@@ -421,12 +427,51 @@ class AftrTcpListener:
 
         req_next_bytes = build_netmsg("NetMsg_Request_Next_SensorDatum")
 
-        if drain:
-            await self._run_sink_drain(reader, writer, step, req_next_bytes)
-        else:
-            await self._run_sink_loop(reader, writer, step, req_next_bytes)
+        try:
+            if drain:
+                await self._run_sink_drain(reader, writer, step, req_next_bytes)
+            else:
+                await self._run_sink_loop(reader, writer, step, req_next_bytes)
+        finally:
+            self.writer = None
+
+    async def run_sink_forever(self, host: str = "127.0.0.1", port: int = 12676,
+                               subscribe_idx: int = -1, step: bool = False,
+                               drain: bool = False, retry_interval: float = 2.0,
+                               on_disconnect: Optional[Callable[[], None]] = None):
+        """Like run_sink, but keeps retrying instead of giving up.
+
+        If the initial connection fails (e.g. AftrBurner isn't running yet),
+        or an established connection is lost mid-stream, this waits
+        `retry_interval` seconds and tries again, forever, until the
+        surrounding task is cancelled (Ctrl+C).
+
+        `on_disconnect`, if given, is called (no args) after each disconnect,
+        before the next connection attempt — useful for clearing any
+        half-received state that shouldn't survive a reconnect.
+        """
+        while True:
+            try:
+                await self.run_sink(host, port, subscribe_idx, step, drain)
+                print(f"Source at {host}:{port} disconnected.", flush=True)
+            except asyncio.CancelledError:
+                raise
+            except (OSError, asyncio.IncompleteReadError) as e:
+                print(f"Could not reach AftrBurner Source at {host}:{port} ({e}).",
+                      flush=True)
+
+            if on_disconnect is not None:
+                on_disconnect()
+
+            print(f"Retrying in {retry_interval:.1f}s...", flush=True)
+            await asyncio.sleep(retry_interval)
 
     async def _run_sink_loop(self, reader, writer, step, req_next_bytes):
+        # Note: asyncio.CancelledError is deliberately NOT caught here — it
+        # must propagate so callers (e.g. run_sink_forever's retry loop) can
+        # tell a real Ctrl+C apart from the peer merely closing the
+        # connection. Swallowing it here would make Ctrl+C look just like a
+        # disconnect, and run_sink_forever would "helpfully" reconnect.
         try:
             while True:
                 if step:
@@ -435,8 +480,6 @@ class AftrTcpListener:
                 msg_id, payload = await read_one_netmsg(reader)
                 log.debug("Recv msg_id=0x%08X len=%d", msg_id, len(payload))
                 self._dispatch(msg_id, payload)
-        except asyncio.CancelledError:
-            print("Sink task cancelled.", flush=True)
         except (asyncio.IncompleteReadError, ConnectionError) as e:
             print(f"Connection to source closed: {e}", flush=True)
         finally:
@@ -475,8 +518,6 @@ class AftrTcpListener:
                 msg_id, payload = latest[0]
                 log.debug("Recv msg_id=0x%08X len=%d", msg_id, len(payload))
                 self._dispatch(msg_id, payload)
-        except asyncio.CancelledError:
-            print("Sink task cancelled.", flush=True)
         finally:
             reader_task.cancel()
             try:
@@ -647,6 +688,15 @@ def _run_async(listener, args):
         print("\nCtrl+C received, shutting down...", flush=True)
         main_task.cancel()
         keepalive_task.cancel()
+
+    if sys.platform == "win32":
+        # Some dependency (numpy/cv2/etc.) may call
+        # SetConsoleCtrlHandler(NULL, TRUE) during import/init, which tells
+        # Windows to unconditionally ignore CTRL_C_EVENT for this process
+        # (CTRL+BREAK can never be ignored this way). Clear that flag
+        # ourselves right before we need Ctrl+C to work.
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(None, False)
 
     signal.signal(signal.SIGINT, _shutdown)
 

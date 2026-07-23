@@ -27,6 +27,14 @@ Single-stream mode — TypeA message differentiation (both on same port):
 Requires the xoftr conda environment (PyTorch, kornia, etc.).
 """
 
+import os
+# Intel's OpenMP/MKL runtime (bundled with torch/numpy on Windows) installs
+# its own Console Control Handler and swallows CTRL_C_EVENT before Python's
+# SIGINT handler ever sees it, so Ctrl+C is silently ignored. This must be
+# set before numpy/torch are imported (below) — it's read once when the
+# runtime installs its handler.
+os.environ.setdefault("FOR_DISABLE_CONSOLE_CTRL_HANDLER", "1")
+
 import asyncio
 import argparse
 import signal
@@ -157,6 +165,15 @@ class XoFTR_AftrBridge:
         self._tir_queue = deque(maxlen=2)
         self._match_count = 0
         self._last_result = None
+
+    def reset_queues(self):
+        """Clear any half-received vis/thermal frames.
+
+        Call after a reconnect so a frame received before a disconnect is
+        never paired against a frame received after it.
+        """
+        self._vis_queue.clear()
+        self._tir_queue.clear()
 
     # -- ImagePair mode (primary) ------------------------------------------
 
@@ -309,8 +326,13 @@ class XoFTR_AftrBridge:
                                 font, scale, (0, 255, 255), thickness, cv2.LINE_AA)
             cv2.imshow("XoFTR Matches", canvas)
             if self.step:
-                print("Press any key in the image window for next pair...", flush=True)
-                while cv2.waitKey(100) == -1:
+                print("Click the image window and press any key for next pair "
+                      "(or Ctrl+C in the terminal to quit)...", flush=True)
+                while True:
+                    key = cv2.waitKey(100)
+                    if key != -1:
+                        print("  Key detected, requesting next pair...", flush=True)
+                        break
                     if self._shutting_down:
                         return
             else:
@@ -329,7 +351,8 @@ async def run_pair_sink(bridge, host, port):
     await listener.run_sink(host, port)
 
 
-async def run_dual_sink(bridge, host, vis_port, tir_port):
+async def run_dual_sink(bridge, host, vis_port, tir_port,
+                        auto_connect=False, reconnect_interval=2.0):
     """Connect to two separate Source endpoints (visible + thermal)."""
     vis_listener = AftrTcpListener()
     tir_listener = AftrTcpListener()
@@ -339,10 +362,20 @@ async def run_dual_sink(bridge, host, vis_port, tir_port):
 
     print("Connecting to visible on port {} and thermal on port {}...".format(
         vis_port, tir_port), flush=True)
-    await asyncio.gather(
-        vis_listener.run_sink(host, vis_port),
-        tir_listener.run_sink(host, tir_port),
-    )
+    if auto_connect:
+        await asyncio.gather(
+            vis_listener.run_sink_forever(host, vis_port,
+                                          retry_interval=reconnect_interval,
+                                          on_disconnect=bridge.reset_queues),
+            tir_listener.run_sink_forever(host, tir_port,
+                                          retry_interval=reconnect_interval,
+                                          on_disconnect=bridge.reset_queues),
+        )
+    else:
+        await asyncio.gather(
+            vis_listener.run_sink(host, vis_port),
+            tir_listener.run_sink(host, tir_port),
+        )
 
 
 async def run_single_sink(bridge, host, port):
@@ -401,6 +434,11 @@ def main():
                         help="Use and display only the top K matches by confidence")
     parser.add_argument("--calib", default=None,
                         help="Path to calibration YAML (same format as create_scene_npz.py)")
+    parser.add_argument("--auto_connect", action="store_true",
+                        help="Keep retrying to connect if AftrBurner isn't running yet, "
+                             "and automatically reconnect if the connection is lost mid-stream.")
+    parser.add_argument("--reconnect_interval", type=float, default=2.0,
+                        help="Seconds between reconnect attempts with --auto_connect (default: 2.0)")
 
     args = parser.parse_args()
 
@@ -466,9 +504,14 @@ def main():
     asyncio.set_event_loop(loop)
 
     if args.mode == "dual":
-        main_coro = run_dual_sink(bridge, args.host, args.vis_port, args.tir_port)
-    elif args.mode == "pair":
-        main_coro = listener.run_sink(args.host, args.port, step=True)
+        main_coro = run_dual_sink(bridge, args.host, args.vis_port, args.tir_port,
+                                  auto_connect=args.auto_connect,
+                                  reconnect_interval=args.reconnect_interval)
+    elif args.auto_connect:
+        main_coro = listener.run_sink_forever(
+            args.host, args.port, step=True,
+            retry_interval=args.reconnect_interval,
+            on_disconnect=bridge.reset_queues)
     else:
         main_coro = listener.run_sink(args.host, args.port, step=True)
 
@@ -485,6 +528,18 @@ def main():
         bridge._shutting_down = True
         main_task.cancel()
         keepalive_task.cancel()
+
+    if sys.platform == "win32":
+        # Some dependency in the import chain (cv2/numpy/torch/MKL) calls
+        # SetConsoleCtrlHandler(NULL, TRUE) somewhere during import/init,
+        # which tells Windows to unconditionally ignore CTRL_C_EVENT for
+        # this process (CTRL+BREAK is unaffected — it can never be
+        # ignored this way, which is why Ctrl+Break still works while
+        # Ctrl+C does nothing). Clear that flag ourselves right before we
+        # need Ctrl+C to work; per MSDN this can be toggled by any process
+        # at any time without side effects.
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(None, False)
 
     signal.signal(signal.SIGINT, _shutdown)
 

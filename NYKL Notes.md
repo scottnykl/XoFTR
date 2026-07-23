@@ -1,6 +1,6 @@
 conda activate xoftr
 
-python run_XoFTR_on_AftrImgPairs.py --port 12676 --show --calib calibration_aftr.yaml --top_k 15
+python run_XoFTR_on_AftrImgPairs.py --port 12676 --step --calib calibration_aftr.yaml --top_k 15 --auto_connect
 
 
 ❯  Let's pretend the first/left image (imageA) is taken from a sensor that is approaching the aircraft (think of automated aerial refueling). We are trying to figure out the pose of the camera that acquired imageA. Now, let's assume we know the full dimensions of the 3D aircraft that is being approached. Let's also assume that we know exactly where the camera's pose was taken in imageB. Given we know the pose of the camera that acquired imageB AND we know the exact scale and dimensions of the aircraft, what can we do to compute the translation between imageA and imageB? We already have the rotation R and the direction T, we sort of just need to compute an approximate scale or come up with another method to find T. Thoughts?
